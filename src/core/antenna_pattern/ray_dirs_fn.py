@@ -1,12 +1,12 @@
 import numpy as np
 import math
 
-from geometry import (
+from .geometry import (
     sample_sphere,
     cart_to_sph,
     rotate_dirs
 )
-from pattern_g3gpp import G_3gPP
+from .pattern_g3gpp import G_3gPP
 
 
 def fibonacci_dirs(n: int) -> np.ndarray:

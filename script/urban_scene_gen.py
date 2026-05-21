@@ -29,8 +29,6 @@ from typing import List, Tuple
 
 import matplotlib
 
-matplotlib.use("TkAgg")
-
 import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -85,7 +83,7 @@ class UrbanConfig:
     tx_power_w: float = 250.0
     tx_height_offset: float = 3.0
 
-    n_rays: int = 150_000
+    n_rays: int = 50_000
     n_max: int = 6
 
     use_physics: bool = True
