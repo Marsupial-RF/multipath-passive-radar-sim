@@ -2,7 +2,6 @@ from __future__ import annotations
 import math
 from numba import cuda
 
-
 @cuda.jit(device=True, inline=True)
 def _xorshift32(s):
     s ^= (s << 13) & 0xFFFFFFFF
@@ -108,7 +107,7 @@ def _perturb_normal(nx, ny, nz, roughness, r1, r2):
     tx = by*nz - bz*ny; ty = bz*nx - bx*nz; tz = bx*ny - by*nx
     phi = 2.0 * math.pi * r1
     theta = roughness * math.sqrt(-2.0 * math.log(max(r2, 1e-10)))
-    if theta > 1.5533:   # ~π/2 × 0.99
+    if theta > 1.5533:  # ~π/2 × 0.99
         theta = 1.5533
     sin_t = math.sin(theta); cos_t = math.cos(theta)
     nx_p = cos_t*nx + sin_t*(math.cos(phi)*tx + math.sin(phi)*bx)
@@ -149,18 +148,18 @@ def _bounce(dx, dy, dz, nx, ny, nz, roughness, epsilon_r, r1, r2):
 @cuda.jit
 def trace_all_kernel(
     pos_out, dir_out, step_powers, power_out, n_pts_out,
-    dirs_in, tx_pos, obs_min, obs_max, obs_roughness, obs_eps,
-    box_min, box_max, n_max, init_power, noise_floor, fspl_c, seed_offset,
+    dirs_in, tx_pos_in, init_power_in, obs_min, obs_max, obs_roughness, obs_eps,
+    box_min, box_max, n_max, noise_floor, fspl_c, seed_offset,
 ):
     ray_id = cuda.grid(1)
     if ray_id >= dirs_in.shape[0]: return
 
     n_obs = obs_min.shape[0]
-    px = tx_pos[0]; py = tx_pos[1]; pz = tx_pos[2]
+    px = tx_pos_in[ray_id, 0]; py = tx_pos_in[ray_id, 1]; pz = tx_pos_in[ray_id, 2]
     dx = dirs_in[ray_id, 0]; dy = dirs_in[ray_id, 1]; dz = dirs_in[ray_id, 2]
     inv = 1.0 / math.sqrt(dx*dx + dy*dy + dz*dz + 1e-30)
     dx *= inv; dy *= inv; dz *= inv
-    power = init_power
+    power = init_power_in[ray_id]
     rng = ((seed_offset * 6364136223846793005 + ray_id * 1442695040888963407 + 1) & 0x7FFFFFFF)
     if rng == 0: rng = 1
     GROUND_EPS = 7.0

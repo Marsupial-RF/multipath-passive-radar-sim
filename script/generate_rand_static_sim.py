@@ -96,7 +96,7 @@ def main():
 
     save_scene(scene, scene_path)
 
-    static = precompute(scene)
+    static = precompute(scene, batch_size=cfg.batch_size)
     save_static(static, static_path)
 
     # Ground mask
