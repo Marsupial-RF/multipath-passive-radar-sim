@@ -7,8 +7,10 @@ from numba import cuda as _cuda
 
 from src.core.gpu.kernels import trace_all_kernel
 from src.core.gpu.utils import fspl_const, obs_arrays, obs_roughness_array, obs_eps_array
-from .static_field import StaticField, fibonacci_dirs
+from .static_field import StaticField
 from .hash         import build_spatial_hash
+
+from src.core.antenna_pattern.ray_dirs_fn import sample_3gpp_dirs_3lobes
 
 
 def precompute(
@@ -17,7 +19,6 @@ def precompute(
     batch_size      : int           = 0,
     threads_per_block: int          = 256,
     cell_size       : Optional[float] = None,
-    ray_dirs_fn     : Callable[[int], np.ndarray] = fibonacci_dirs,
 ) -> StaticField:
     """
     Trace scene without UAV or Rx; build spatial hash.
@@ -58,58 +59,64 @@ def precompute(
     all_npts: List[np.ndarray] = []
     all_txid: List[np.ndarray] = []
 
+
+    dirs_per_globe = sample_3gpp_dirs_3lobes(scene.n_rays)
+
+
     for tx in scene.transmitters:
         tx_pos_np = np.asarray(tx.position, dtype=np.float32)
         init_pwr  = np.float32(tx.tx_power_dbm)
-        dirs = ray_dirs_fn(scene.n_rays)
-        N_rays    = dirs.shape[0]
-        _bs       = N_rays if batch_size <= 0 else batch_size
+        
+        
+        for i in [0,1,2]:
+            N_rays    = dirs_per_globe[i].shape[0]
+            _bs       = N_rays if batch_size <= 0 else batch_size
 
-        tx_pos_l : List[np.ndarray] = []
-        tx_dir_l : List[np.ndarray] = []
-        tx_sp_l  : List[np.ndarray] = []
-        tx_npts_l: List[np.ndarray] = []
+            tx_pos_l : List[np.ndarray] = []
+            tx_dir_l : List[np.ndarray] = []
+            tx_sp_l  : List[np.ndarray] = []
+            tx_npts_l: List[np.ndarray] = []
 
-        for b_idx, start in enumerate(range(0, N_rays, _bs)):
-            batch = dirs[start:start+_bs]; NB = batch.shape[0]
+            for b_idx, start in enumerate(range(0, N_rays, _bs)):
+                batch = dirs_per_globe[i][start:start+_bs]; NB = batch.shape[0]
 
-            pos_g  = _cuda.device_array((n_max+2, NB, 3), dtype=np.float32)
-            dir_g  = _cuda.device_array((n_max+2, NB, 3), dtype=np.float32)
-            sp_g   = _cuda.device_array((n_max+2, NB),    dtype=np.float32)
-            pwr_g  = _cuda.device_array((NB,),             dtype=np.float32)
-            npts_g = _cuda.device_array((NB,),             dtype=np.int32)
-            npts_g.copy_to_device(np.ones(NB, dtype=np.int32))
+                pos_g  = _cuda.device_array((n_max+2, NB, 3), dtype=np.float32)
+                dir_g  = _cuda.device_array((n_max+2, NB, 3), dtype=np.float32)
+                sp_g   = _cuda.device_array((n_max+2, NB),    dtype=np.float32)
+                pwr_g  = _cuda.device_array((NB,),             dtype=np.float32)
+                npts_g = _cuda.device_array((NB,),             dtype=np.int32)
+                npts_g.copy_to_device(np.ones(NB, dtype=np.int32))
 
-            seed_off = np.int32(seed_val * 999983 + b_idx * 7919 + tx.tx_id * 31337)
-            bpg      = (NB + threads_per_block - 1) // threads_per_block
+                seed_off = np.int32(seed_val * 999983 + b_idx * 7919 + tx.tx_id * 31337)
+                bpg      = (NB + threads_per_block - 1) // threads_per_block
 
-            trace_all_kernel[bpg, threads_per_block](
-                pos_g, dir_g, sp_g, pwr_g, npts_g,
-                _cuda.to_device(batch),
-                _cuda.to_device(tx_pos_np),
-                _cuda.to_device(obs_min_np), _cuda.to_device(obs_max_np),
-                _cuda.to_device(obs_rough_np),
-                _cuda.to_device(obs_eps_np),
-                _cuda.to_device(box_min_np), _cuda.to_device(box_max_np),
-                np.int32(n_max), init_pwr,
-                np.float32(noise_floor), fc_c, seed_off,
-            )
-            _cuda.synchronize()
+                trace_all_kernel[bpg, threads_per_block](
+                    pos_g, dir_g, sp_g, pwr_g, npts_g,
+                    _cuda.to_device(batch),
+                    _cuda.to_device(tx_pos_np),
+                    _cuda.to_device(obs_min_np), _cuda.to_device(obs_max_np),
+                    _cuda.to_device(obs_rough_np),
+                    _cuda.to_device(obs_eps_np),
+                    _cuda.to_device(box_min_np), _cuda.to_device(box_max_np),
+                    np.int32(n_max), init_pwr,
+                    np.float32(noise_floor), fc_c, seed_off,
+                )
+                _cuda.synchronize()
 
-            tx_pos_l.append(pos_g.copy_to_host())
-            tx_dir_l.append(dir_g.copy_to_host())
-            tx_sp_l.append(sp_g.copy_to_host())
-            tx_npts_l.append(npts_g.copy_to_host())
+                tx_pos_l.append(pos_g.copy_to_host())
+                tx_dir_l.append(dir_g.copy_to_host())
+                tx_sp_l.append(sp_g.copy_to_host())
+                tx_npts_l.append(npts_g.copy_to_host())
 
-        pos_tx  = np.concatenate(tx_pos_l,  axis=1)
-        dir_tx  = np.concatenate(tx_dir_l,  axis=1)
-        sp_tx   = np.concatenate(tx_sp_l,   axis=1)
-        npts_tx = np.concatenate(tx_npts_l, axis=0)
-        txid_tx = np.full(N_rays, tx.tx_id, dtype=np.int32)
+            pos_tx  = np.concatenate(tx_pos_l,  axis=1)
+            dir_tx  = np.concatenate(tx_dir_l,  axis=1)
+            sp_tx   = np.concatenate(tx_sp_l,   axis=1)
+            npts_tx = np.concatenate(tx_npts_l, axis=0)
+            txid_tx = np.full(N_rays, tx.tx_id*3+i, dtype=np.int32)
 
-        all_pos.append(pos_tx);  all_dir.append(dir_tx)
-        all_sp.append(sp_tx);    all_npts.append(npts_tx)
-        all_txid.append(txid_tx)
+            all_pos.append(pos_tx);  all_dir.append(dir_tx)
+            all_sp.append(sp_tx);    all_npts.append(npts_tx)
+            all_txid.append(txid_tx)
 
     pos_cpu  = np.concatenate(all_pos,  axis=1)
     dir_cpu  = np.concatenate(all_dir,  axis=1)

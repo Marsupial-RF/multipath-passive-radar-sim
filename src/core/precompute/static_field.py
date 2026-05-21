@@ -40,17 +40,4 @@ class StaticField:
     spatial_hash: SpatialHash
     fc          : float
     scene_ref   : object
-    rx_ref      : object = None    # Receiver — set by apply_rx()
-
-
-def fibonacci_dirs(n: int) -> np.ndarray:
-    """Uniformly distributed unit directions on sphere (Fibonacci lattice). Returns (n,3) float32."""
-    golden = (1.0 + math.sqrt(5.0)) / 2.0
-    i      = np.arange(n, dtype=np.float64)
-    theta  = np.arccos(np.clip(1.0 - 2.0 * (i + 0.5) / n, -1.0, 1.0))
-    phi    = 2.0 * math.pi * i / golden
-    return np.column_stack([
-        np.sin(theta) * np.cos(phi),
-        np.sin(theta) * np.sin(phi),
-        np.cos(theta),
-    ]).astype(np.float32)
+    rx_ref      : object = None
