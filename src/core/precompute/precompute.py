@@ -30,7 +30,7 @@ def precompute(
     n_max       = int(scene.n_max)
     use_physics = bool(scene.use_physics)
     noise_floor = float(scene.noise_floor_dbm) if use_physics else float('-inf')
-    cs          = cell_size if cell_size is not None else 5.0
+    cs          = cell_size if cell_size is not None else 50.0
     fc          = float(scene.transmitters[0].frequency)
     fc_c        = np.float32(fspl_const(fc))
 
@@ -121,7 +121,6 @@ def precompute(
 
     sh = build_spatial_hash(pos_cpu, npts_cpu, box_min_np, box_max_np,
                             cs, threads_per_block)
-
     return StaticField(
         pos_cpu     = pos_cpu,
         dir_cpu     = dir_cpu,

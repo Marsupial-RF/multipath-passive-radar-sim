@@ -92,6 +92,7 @@ def main():
         "tx_pos_z",
         "tx_power_w",
         "tx_freq_hz",
+        "tx_lobe_theta_rad"
     ]
 
     save_scene(scene, scene_path)
@@ -119,9 +120,12 @@ def main():
 
         for ray in rx_rays:
 
-            tx = scene.transmitters[ray.transmitter_id]
+            tx = scene.transmitters[ray.transmitter_id //3]
 
             last_bounce = ray.points[-2]
+
+            lobe_id = ray.transmitter_id % 3
+            lobe_theta_rad = (2 * np.pi / 3) * lobe_id
 
             rows.append({
                 "instance_id": sid,
@@ -153,6 +157,7 @@ def main():
 
                 "tx_power_w": float(tx.tx_power_w),
                 "tx_freq_hz": float(tx.frequency),
+                "tx_lobe_theta_rad": float(lobe_theta_rad),
             })
 
 

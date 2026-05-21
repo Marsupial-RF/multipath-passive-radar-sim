@@ -83,8 +83,8 @@ class UrbanConfig:
     tx_power_w: float = 250.0
     tx_height_offset: float = 3.0
 
-    n_rays: int = 500_000
-    batch_size: int = 250_000
+    n_rays: int = 250_000
+    batch_size: int = 100_000
     n_max: int = 6
 
     use_physics: bool = True
