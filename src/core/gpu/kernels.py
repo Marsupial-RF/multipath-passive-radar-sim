@@ -1,478 +1,290 @@
 from __future__ import annotations
 import math
+from numba import cuda
 
-try:
-    from numba import cuda
-    _HAS_CUDA = True
-except ImportError:
-    _HAS_CUDA = False
-    cuda = None  # type: ignore
+@cuda.jit(device=True, inline=True)
+def _xorshift32(s):
+    s ^= (s << 13) & 0xFFFFFFFF
+    s ^= (s >> 17) & 0xFFFFFFFF
+    s ^= (s << 5)  & 0xFFFFFFFF
+    return s & 0xFFFFFFFF
 
+@cuda.jit(device=True, inline=True)
+def _rand01(s):
+    s = _xorshift32(s)
+    return (s & 0xFFFFFF) * (1.0 / 16777216.0), s
 
-if _HAS_CUDA:
+@cuda.jit(device=True)
+def _ray_aabb(ox, oy, oz, dx, dy, dz, bx0, by0, bz0, bx1, by1, bz1, t_min):
+    INF = 1e30
+    t_enter = -INF; t_exit = INF
+    ent_ax = -1; ent_s = 0.0
+    if math.fabs(dx) < 1e-12:
+        if ox < bx0 or ox > bx1: return INF, 0.0, 0.0, 0.0
+    else:
+        inv = 1.0 / dx
+        t1 = (bx0 - ox) * inv; t2 = (bx1 - ox) * inv
+        if t1 > t2: t1, t2 = t2, t1
+        if t1 > t_enter: t_enter = t1; ent_ax = 0; ent_s = dx
+        if t2 < t_exit:  t_exit  = t2
+    if math.fabs(dy) < 1e-12:
+        if oy < by0 or oy > by1: return INF, 0.0, 0.0, 0.0
+    else:
+        inv = 1.0 / dy
+        t1 = (by0 - oy) * inv; t2 = (by1 - oy) * inv
+        if t1 > t2: t1, t2 = t2, t1
+        if t1 > t_enter: t_enter = t1; ent_ax = 1; ent_s = dy
+        if t2 < t_exit:  t_exit  = t2
+    if math.fabs(dz) < 1e-12:
+        if oz < bz0 or oz > bz1: return INF, 0.0, 0.0, 0.0
+    else:
+        inv = 1.0 / dz
+        t1 = (bz0 - oz) * inv; t2 = (bz1 - oz) * inv
+        if t1 > t2: t1, t2 = t2, t1
+        if t1 > t_enter: t_enter = t1; ent_ax = 2; ent_s = dz
+        if t2 < t_exit:  t_exit  = t2
+    if t_enter > t_exit or t_exit < t_min: return INF, 0.0, 0.0, 0.0
+    t_hit = t_enter if t_enter >= t_min else t_exit
+    if t_hit < t_min: return INF, 0.0, 0.0, 0.0
+    n_val = -1.0 if ent_s > 0.0 else 1.0
+    nx_ = n_val if ent_ax == 0 else 0.0
+    ny_ = n_val if ent_ax == 1 else 0.0
+    nz_ = n_val if ent_ax == 2 else 0.0
+    return t_hit, nx_, ny_, nz_
 
-    # ── RNG ───────────────────────────────────────────────────────────────────
+@cuda.jit(device=True)
+def _ray_sphere(ox, oy, oz, dx, dy, dz, cx, cy, cz, r, t_min):
+    ocx = ox - cx; ocy = oy - cy; ocz = oz - cz
+    a = dx*dx + dy*dy + dz*dz
+    b = 2.0*(ocx*dx + ocy*dy + ocz*dz)
+    c = ocx*ocx + ocy*ocy + ocz*ocz - r*r
+    disc = b*b - 4.0*a*c
+    if disc < 0.0: return 1e30
+    sq = math.sqrt(disc)
+    t1 = (-b - sq) / (2.0*a); t2 = (-b + sq) / (2.0*a)
+    if t1 > t_min: return t1
+    if t2 > t_min: return t2
+    return 1e30
 
-    @cuda.jit(device=True, inline=True)
-    def _xorshift32(s):
-        s ^= (s << 13) & 0xFFFFFFFF
-        s ^= (s >> 17) & 0xFFFFFFFF
-        s ^= (s << 5)  & 0xFFFFFFFF
-        return s & 0xFFFFFFFF
+@cuda.jit(device=True)
+def _ray_floor(ox, oy, oz, dx, dy, dz, floor_z, bx0, by0, bx1, by1, t_min):
+    if dz > -1e-10: return 1e30, 0.0, 0.0, 1.0
+    t = (floor_z - oz) / dz
+    if t < t_min: return 1e30, 0.0, 0.0, 1.0
+    hx = ox + t*dx; hy = oy + t*dy
+    if bx0 <= hx <= bx1 and by0 <= hy <= by1:
+        return t, 0.0, 0.0, 1.0
+    return 1e30, 0.0, 0.0, 1.0
 
-    @cuda.jit(device=True, inline=True)
-    def _rand01(s):
-        """Returns (uniform float in [0,1), new_state)."""
-        s = _xorshift32(s)
-        return (s & 0xFFFFFF) * (1.0 / 16777216.0), s
+@cuda.jit(device=True)
+def _domain_exit(ox, oy, oz, dx, dy, dz, bx0, by0, bx1, by1, bz1, t_min):
+    best = 1e30
+    if dx > 1e-12:
+        t = (bx1 - ox) / dx
+        if t_min < t < best: best = t
+    elif dx < -1e-12:
+        t = (bx0 - ox) / dx
+        if t_min < t < best: best = t
+    if dy > 1e-12:
+        t = (by1 - oy) / dy
+        if t_min < t < best: best = t
+    elif dy < -1e-12:
+        t = (by0 - oy) / dy
+        if t_min < t < best: best = t
+    if dz > 1e-12:
+        t = (bz1 - oz) / dz
+        if t_min < t < best: best = t
+    return best
 
-    # ── Geometry primitives ───────────────────────────────────────────────────
+@cuda.jit(device=True)
+def _perturb_normal(nx, ny, nz, roughness, r1, r2):
+    if roughness < 1e-5: return nx, ny, nz
+    if math.fabs(nx) < 0.9: tx, ty, tz = 1.0, 0.0, 0.0
+    else: tx, ty, tz = 0.0, 1.0, 0.0
+    bx = ny*tz - nz*ty; by = nz*tx - nx*tz; bz = nx*ty - ny*tx
+    inv = 1.0 / math.sqrt(bx*bx + by*by + bz*bz + 1e-30)
+    bx *= inv; by *= inv; bz *= inv
+    tx = by*nz - bz*ny; ty = bz*nx - bx*nz; tz = bx*ny - by*nx
+    phi = 2.0 * math.pi * r1
+    theta = roughness * math.sqrt(-2.0 * math.log(max(r2, 1e-10)))
+    if theta > 1.5533:  # ~π/2 × 0.99
+        theta = 1.5533
+    sin_t = math.sin(theta); cos_t = math.cos(theta)
+    nx_p = cos_t*nx + sin_t*(math.cos(phi)*tx + math.sin(phi)*bx)
+    ny_p = cos_t*ny + sin_t*(math.cos(phi)*ty + math.sin(phi)*by)
+    nz_p = cos_t*nz + sin_t*(math.cos(phi)*tz + math.sin(phi)*bz)
+    inv = 1.0 / math.sqrt(nx_p*nx_p + ny_p*ny_p + nz_p*nz_p + 1e-30)
+    return nx_p*inv, ny_p*inv, nz_p*inv
 
-    @cuda.jit(device=True)
-    def _ray_aabb(ox, oy, oz, dx, dy, dz,
-                  bx0, by0, bz0, bx1, by1, bz1, t_min):
-        """Slab method. Returns (t, nx, ny, nz) or (1e30, 0,0,0) on miss."""
-        INF = 1e30
-        t_enter = -INF; t_exit = INF
-        ent_ax = -1; ent_s = 0.0
+@cuda.jit(device=True, inline=True)
+def _reflect(dx, dy, dz, nx, ny, nz):
+    dot = dx*nx + dy*ny + dz*nz
+    rx = dx - 2.0*dot*nx; ry = dy - 2.0*dot*ny; rz = dz - 2.0*dot*nz
+    inv = 1.0 / math.sqrt(rx*rx + ry*ry + rz*rz + 1e-30)
+    return rx*inv, ry*inv, rz*inv
 
-        if math.fabs(dx) < 1e-12:
-            if ox < bx0 or ox > bx1: return INF, 0.0, 0.0, 0.0
-        else:
-            inv = 1.0 / dx
-            t1 = (bx0 - ox) * inv; t2 = (bx1 - ox) * inv
-            if t1 > t2: t1, t2 = t2, t1
-            if t1 > t_enter: t_enter = t1; ent_ax = 0; ent_s = dx
-            if t2 < t_exit:  t_exit  = t2
+@cuda.jit(device=True, inline=True)
+def _reflection_intensity(dx, dy, dz, nx, ny, nz, epsilon_r):
+    cos_ti = -(dx*nx + dy*ny + dz*nz)
+    if cos_ti < 0.0: cos_ti = -cos_ti
+    if cos_ti > 1.0: cos_ti = 1.0
+    sin2_ti = 1.0 - cos_ti * cos_ti
+    val = epsilon_r - sin2_ti
+    if val < 0.0: val = 0.0
+    sqrt_term = math.sqrt(val)
+    r_te = (cos_ti - sqrt_term) / (cos_ti + sqrt_term)
+    R_te = r_te * r_te
+    r_tm = (epsilon_r * cos_ti - sqrt_term) / (epsilon_r * cos_ti + sqrt_term)
+    R_tm = r_tm * r_tm
+    return 0.5 * (R_te + R_tm)
 
-        if math.fabs(dy) < 1e-12:
-            if oy < by0 or oy > by1: return INF, 0.0, 0.0, 0.0
-        else:
-            inv = 1.0 / dy
-            t1 = (by0 - oy) * inv; t2 = (by1 - oy) * inv
-            if t1 > t2: t1, t2 = t2, t1
-            if t1 > t_enter: t_enter = t1; ent_ax = 1; ent_s = dy
-            if t2 < t_exit:  t_exit  = t2
+@cuda.jit(device=True)
+def _bounce(dx, dy, dz, nx, ny, nz, roughness, epsilon_r, r1, r2):
+    nx_p, ny_p, nz_p = _perturb_normal(nx, ny, nz, roughness, r1, r2)
+    rx, ry, rz = _reflect(dx, dy, dz, nx_p, ny_p, nz_p)
+    refl = _reflection_intensity(dx, dy, dz, nx_p, ny_p, nz_p, epsilon_r)
+    return rx, ry, rz, refl
 
-        if math.fabs(dz) < 1e-12:
-            if oz < bz0 or oz > bz1: return INF, 0.0, 0.0, 0.0
-        else:
-            inv = 1.0 / dz
-            t1 = (bz0 - oz) * inv; t2 = (bz1 - oz) * inv
-            if t1 > t2: t1, t2 = t2, t1
-            if t1 > t_enter: t_enter = t1; ent_ax = 2; ent_s = dz
-            if t2 < t_exit:  t_exit  = t2
+@cuda.jit
+def trace_all_kernel(
+    pos_out, dir_out, step_powers, power_out, n_pts_out,
+    dirs_in, tx_pos_in, init_power_in, obs_min, obs_max, obs_roughness, obs_eps,
+    box_min, box_max, n_max, noise_floor, fspl_c, seed_offset,
+):
+    ray_id = cuda.grid(1)
+    if ray_id >= dirs_in.shape[0]: return
 
-        if t_enter > t_exit or t_exit < t_min: return INF, 0.0, 0.0, 0.0
-        t_hit = t_enter if t_enter >= t_min else t_exit
-        if t_hit < t_min: return INF, 0.0, 0.0, 0.0
+    n_obs = obs_min.shape[0]
+    px = tx_pos_in[ray_id, 0]; py = tx_pos_in[ray_id, 1]; pz = tx_pos_in[ray_id, 2]
+    dx = dirs_in[ray_id, 0]; dy = dirs_in[ray_id, 1]; dz = dirs_in[ray_id, 2]
+    inv = 1.0 / math.sqrt(dx*dx + dy*dy + dz*dz + 1e-30)
+    dx *= inv; dy *= inv; dz *= inv
+    power = init_power_in[ray_id]
+    rng = ((seed_offset * 6364136223846793005 + ray_id * 1442695040888963407 + 1) & 0x7FFFFFFF)
+    if rng == 0: rng = 1
+    GROUND_EPS = 7.0
 
-        n_val = -1.0 if ent_s > 0.0 else 1.0
-        nx_ = n_val if ent_ax == 0 else 0.0
-        ny_ = n_val if ent_ax == 1 else 0.0
-        nz_ = n_val if ent_ax == 2 else 0.0
-        return t_hit, nx_, ny_, nz_
+    pos_out[0, ray_id, 0] = px; pos_out[0, ray_id, 1] = py; pos_out[0, ray_id, 2] = pz
+    dir_out[0, ray_id, 0] = dx; dir_out[0, ray_id, 1] = dy; dir_out[0, ray_id, 2] = dz
+    step_powers[0, ray_id] = power
+    n_pts = 1
 
-    @cuda.jit(device=True)
-    def _ray_sphere(ox, oy, oz, dx, dy, dz, cx, cy, cz, r, t_min):
-        """Returns first positive t > t_min, or 1e30 on miss."""
-        ocx = ox - cx; ocy = oy - cy; ocz = oz - cz
-        a   = dx*dx + dy*dy + dz*dz
-        b   = 2.0*(ocx*dx + ocy*dy + ocz*dz)
-        c   = ocx*ocx + ocy*ocy + ocz*ocz - r*r
-        disc = b*b - 4.0*a*c
-        if disc < 0.0: return 1e30
-        sq = math.sqrt(disc)
-        t1 = (-b - sq) / (2.0*a); t2 = (-b + sq) / (2.0*a)
-        if t1 > t_min: return t1
-        if t2 > t_min: return t2
-        return 1e30
+    for bounce_idx in range(n_max):
+        t_floor, floor_nx, floor_ny, floor_nz = _ray_floor(px, py, pz, dx, dy, dz, box_min[2], box_min[0], box_min[1], box_max[0], box_max[1], 1e-5)
+        t_exit = _domain_exit(px, py, pz, dx, dy, dz, box_min[0], box_min[1], box_max[0], box_max[1], box_max[2], 1e-5)
 
-    @cuda.jit(device=True)
-    def _ray_floor(ox, oy, oz, dx, dy, dz,
-                   floor_z, bx0, by0, bx1, by1, t_min):
-        """Horizontal floor at floor_z. Returns (t, 0,0,1) or (1e30,…)."""
-        if dz > -1e-10: return 1e30, 0.0, 0.0, 1.0
-        t = (floor_z - oz) / dz
-        if t < t_min: return 1e30, 0.0, 0.0, 1.0
-        hx = ox + t*dx; hy = oy + t*dy
-        if bx0 <= hx <= bx1 and by0 <= hy <= by1:
-            return t, 0.0, 0.0, 1.0
-        return 1e30, 0.0, 0.0, 1.0
+        best_t = 1e30; best_nx = 0.0; best_ny = 0.0; best_nz = 0.0; best_obs_idx = -1; best_kind = 3
+        for obs_idx in range(n_obs):
+            t_obs, obs_nx, obs_ny, obs_nz = _ray_aabb(px, py, pz, dx, dy, dz, obs_min[obs_idx, 0], obs_min[obs_idx, 1], obs_min[obs_idx, 2], obs_max[obs_idx, 0], obs_max[obs_idx, 1], obs_max[obs_idx, 2], 1e-5)
+            if t_obs < best_t:
+                best_t = t_obs; best_nx = obs_nx; best_ny = obs_ny; best_nz = obs_nz; best_obs_idx = obs_idx; best_kind = 0
+        if t_floor < best_t:
+            best_t = t_floor; best_nx = floor_nx; best_ny = floor_ny; best_nz = floor_nz; best_obs_idx = -1; best_kind = 1
+        if t_exit <= best_t:
+            best_t = t_exit; best_kind = 2
 
-    @cuda.jit(device=True)
-    def _domain_exit(ox, oy, oz, dx, dy, dz,
-                     bx0, by0, bx1, by1, bz1, t_min):
-        """Nearest wall/ceiling exit. Returns t or 1e30."""
-        best = 1e30
-        if dx > 1e-12:
-            t = (bx1 - ox) / dx
-            if t_min < t < best: best = t
-        elif dx < -1e-12:
-            t = (bx0 - ox) / dx
-            if t_min < t < best: best = t
-        if dy > 1e-12:
-            t = (by1 - oy) / dy
-            if t_min < t < best: best = t
-        elif dy < -1e-12:
-            t = (by0 - oy) / dy
-            if t_min < t < best: best = t
-        if dz > 1e-12:
-            t = (bz1 - oz) / dz
-            if t_min < t < best: best = t
-        return best
-
-    # ── Scatter — SINGLE implementation used by both kernels ─────────────────
-
-    @cuda.jit(device=True)
-    def _scatter(dx, dy, dz, nx, ny, nz, roughness, r1, r2):
-        """
-        Specular + cosine-weighted Lambertian blend.
-        r1, r2 ∈ [0,1) from the kernel RNG.
-        Returns normalised outgoing direction (ox, oy, oz).
-        Physics identical to v2 scatter_ray.
-        """
-        # Specular
-        dot = dx*nx + dy*ny + dz*nz
-        sx = dx - 2.0*dot*nx
-        sy = dy - 2.0*dot*ny
-        sz = dz - 2.0*dot*nz
-        inv = 1.0 / math.sqrt(sx*sx + sy*sy + sz*sz + 1e-30)
-        sx *= inv; sy *= inv; sz *= inv
-
-        if roughness < 1e-5:
-            return sx, sy, sz
-
-        # Cosine-weighted hemisphere sample
-        phi   = 2.0 * math.pi * r1
-        sin_t = math.sqrt(r2)
-        cos_t = math.sqrt(1.0 - r2)
-
-        # ONB (Gram-Schmidt)
-        if math.fabs(nx) < 0.9:
-            hx = 1.0; hy = 0.0; hz = 0.0
-        else:
-            hx = 0.0; hy = 1.0; hz = 0.0
-        tx = hy*nz - hz*ny; ty = hz*nx - hx*nz; tz = hx*ny - hy*nx
-        inv = 1.0 / math.sqrt(tx*tx + ty*ty + tz*tz + 1e-30)
-        tx *= inv; ty *= inv; tz *= inv
-        bx = ny*tz - nz*ty; by = nz*tx - nx*tz; bz = nx*ty - ny*tx
-
-        dfx = sin_t*math.cos(phi)*tx + sin_t*math.sin(phi)*bx + cos_t*nx
-        dfy = sin_t*math.cos(phi)*ty + sin_t*math.sin(phi)*by + cos_t*ny
-        dfz = sin_t*math.cos(phi)*tz + sin_t*math.sin(phi)*bz + cos_t*nz
-
-        ro = roughness
-        ox = (1.0-ro)*sx + ro*dfx
-        oy = (1.0-ro)*sy + ro*dfy
-        oz = (1.0-ro)*sz + ro*dfz
-        inv = 1.0 / math.sqrt(ox*ox + oy*oy + oz*oz + 1e-30)
-        ox *= inv; oy *= inv; oz *= inv
-
-        if ox*nx + oy*ny + oz*nz <= 0.0:
-            inv = 1.0 / math.sqrt(dfx*dfx + dfy*dfy + dfz*dfz + 1e-30)
-            return dfx*inv, dfy*inv, dfz*inv
-        return ox, oy, oz
-
-    # ── trace_all_kernel ─────────────────────────────────────────────────────
-
-    @cuda.jit
-    def trace_all_kernel(
-        pos_out,       # float32[N_max+2, N_rays, 3]
-        dir_out,       # float32[N_max+2, N_rays, 3]
-        step_powers,   # float32[N_max+2, N_rays]
-        power_out,     # float32[N_rays]
-        n_pts_out,     # int32[N_rays]
-        reached_rx,    # int32[N_rays]
-        dirs_in,       # float32[N_rays, 3]
-        tx_pos,        # float32[3]
-        obs_min,       # float32[N_obs, 3]
-        obs_max,       # float32[N_obs, 3]
-        rx_pos,        # float32[3]
-        box_min,       # float32[3]
-        box_max,       # float32[3]
-        rx_rad, n_max, init_power, noise_floor, roughness, fspl_c, seed_offset,
-    ):
-        ray_id = cuda.grid(1)
-        if ray_id >= dirs_in.shape[0]: return
-        N_obs = obs_min.shape[0]
-
-        px = tx_pos[0]; py = tx_pos[1]; pz = tx_pos[2]
-        dx = dirs_in[ray_id, 0]; dy = dirs_in[ray_id, 1]; dz = dirs_in[ray_id, 2]
-        inv = 1.0 / math.sqrt(dx*dx + dy*dy + dz*dz + 1e-30)
-        dx *= inv; dy *= inv; dz *= inv
-
-        power = init_power
-        rng = ((seed_offset * 6364136223846793005 + ray_id * 1442695040888963407 + 1) & 0x7FFFFFFF)
-        if rng == 0: rng = 1
-
-        pos_out[0, ray_id, 0] = px; pos_out[0, ray_id, 1] = py; pos_out[0, ray_id, 2] = pz
-        dir_out[0, ray_id, 0] = dx; dir_out[0, ray_id, 1] = dy; dir_out[0, ray_id, 2] = dz
-        step_powers[0, ray_id] = power
-        n_pts = 1
-
-        for _bounce in range(n_max):
-            t_rx = _ray_sphere(px, py, pz, dx, dy, dz,
-                               rx_pos[0], rx_pos[1], rx_pos[2], rx_rad, 1e-5)
-            t_fl, fnx, fny, fnz = _ray_floor(
-                px, py, pz, dx, dy, dz,
-                box_min[2], box_min[0], box_min[1], box_max[0], box_max[1], 1e-5)
-            t_ex = _domain_exit(px, py, pz, dx, dy, dz,
-                                box_min[0], box_min[1], box_max[0], box_max[1], box_max[2], 1e-5)
-
-            best_t = 1e30; best_nx = 0.0; best_ny = 0.0; best_nz = 0.0; best_kind = 3
-            for obs_i in range(N_obs):
-                t_ob, onx, ony, onz = _ray_aabb(
-                    px, py, pz, dx, dy, dz,
-                    obs_min[obs_i,0], obs_min[obs_i,1], obs_min[obs_i,2],
-                    obs_max[obs_i,0], obs_max[obs_i,1], obs_max[obs_i,2], 1e-5)
-                if t_ob < best_t:
-                    best_t = t_ob; best_nx = onx; best_ny = ony; best_nz = onz; best_kind = 0
-            if t_fl < best_t:
-                best_t = t_fl; best_nx = fnx; best_ny = fny; best_nz = fnz; best_kind = 1
-            if t_ex <= best_t:
-                best_t = t_ex; best_kind = 2
-
-            # RX reached
-            if t_rx < best_t and t_rx < 1e29:
-                dist = t_rx if t_rx > 1e-9 else 1e-9
-                power -= 20.0 * math.log10(dist) + fspl_c
-                hx = px + t_rx*dx; hy = py + t_rx*dy; hz = pz + t_rx*dz
-                pos_out[n_pts, ray_id, 0] = hx; pos_out[n_pts, ray_id, 1] = hy; pos_out[n_pts, ray_id, 2] = hz
+        if best_kind == 2 or best_t >= 1e29:
+            if best_t < 1e29:
+                pos_out[n_pts, ray_id, 0] = px + best_t*dx; pos_out[n_pts, ray_id, 1] = py + best_t*dy; pos_out[n_pts, ray_id, 2] = pz + best_t*dz
                 dir_out[n_pts, ray_id, 0] = dx; dir_out[n_pts, ray_id, 1] = dy; dir_out[n_pts, ray_id, 2] = dz
                 step_powers[n_pts, ray_id] = power
                 n_pts += 1
-                power_out[ray_id] = power; n_pts_out[ray_id] = n_pts
-                if power > noise_floor: reached_rx[ray_id] = 1
-                return
+            power_out[ray_id] = power; n_pts_out[ray_id] = n_pts
+            return
 
-            # Domain exit or no hit
-            if best_kind == 2 or best_t >= 1e29:
-                if best_t < 1e29:
-                    pos_out[n_pts, ray_id, 0] = px + best_t*dx
-                    pos_out[n_pts, ray_id, 1] = py + best_t*dy
-                    pos_out[n_pts, ray_id, 2] = pz + best_t*dz
-                    n_pts += 1
-                power_out[ray_id] = power; n_pts_out[ray_id] = n_pts
-                return
+        current_eps = GROUND_EPS; current_rough = 0.0
+        if best_kind == 0:
+            current_eps = obs_eps[best_obs_idx]; current_rough = obs_roughness[best_obs_idx]
 
-            # Surface hit
-            hx = px + best_t*dx; hy = py + best_t*dy; hz = pz + best_t*dz
+        hit_x = px + best_t*dx; hit_y = py + best_t*dy; hit_z = pz + best_t*dz
+        dist = best_t if best_t > 1e-9 else 1e-9
+        power -= 20.0 * math.log10(dist) + fspl_c
+        r1, rng = _rand01(rng); r2, rng = _rand01(rng)
+        dx_new, dy_new, dz_new, refl = _bounce(dx, dy, dz, best_nx, best_ny, best_nz, current_rough, current_eps, r1, r2)
+        if refl < 1e-6: refl = 1e-6
+        power += 10.0 * math.log10(refl)
+
+        pos_out[n_pts, ray_id, 0] = hit_x; pos_out[n_pts, ray_id, 1] = hit_y; pos_out[n_pts, ray_id, 2] = hit_z
+        dir_out[n_pts, ray_id, 0] = dx_new; dir_out[n_pts, ray_id, 1] = dy_new; dir_out[n_pts, ray_id, 2] = dz_new
+        step_powers[n_pts, ray_id] = power
+        n_pts += 1
+        if power <= noise_floor:
+            n_pts_out[ray_id] = n_pts; power_out[ray_id] = power
+            return
+        dx = dx_new; dy = dy_new; dz = dz_new
+        px = hit_x + 1e-4 * dx; py = hit_y + 1e-4 * dy; pz = hit_z + 1e-4 * dz
+    n_pts_out[ray_id] = n_pts; power_out[ray_id] = power
+
+@cuda.jit
+def mini_trace_kernel(
+    reached_rx, power_out, arr_dir_out, sample_dir_out, pos_out, n_pts_out,
+    hit_pts, v_in_dirs, n_uav_normals, init_powers,
+    obs_min, obs_max, obs_roughness, obs_eps,
+    rx_pos, box_min, box_max,
+    rx_rad, n_post, noise_floor, uav_roughness, n_samp, fspl_c, seed_offset,
+):
+    tid = cuda.grid(1)
+    if tid >= hit_pts.shape[0]: return
+    ray_idx = tid // n_samp; samp_id = tid % n_samp; n_obs = obs_min.shape[0]
+    px = hit_pts[ray_idx, 0]; py = hit_pts[ray_idx, 1]; pz = hit_pts[ray_idx, 2]
+    nx = n_uav_normals[ray_idx, 0]; ny = n_uav_normals[ray_idx, 1]; nz = n_uav_normals[ray_idx, 2]
+    vx = v_in_dirs[ray_idx, 0]; vy = v_in_dirs[ray_idx, 1]; vz = v_in_dirs[ray_idx, 2]
+    power = init_powers[ray_idx]
+    UAV_EPS = 3.0; GROUND_EPS = 7.0
+    rng = ((seed_offset * 6364136223846793005 + tid * 1442695040888963407 + 1) & 0x7FFFFFFF)
+    if rng == 0: rng = 1
+    if samp_id == 0: dx, dy, dz, _ = _bounce(vx, vy, vz, nx, ny, nz, 0.0, UAV_EPS, 0.0, 0.0)
+    else:
+        r1, rng = _rand01(rng); r2, rng = _rand01(rng)
+        dx, dy, dz, _ = _bounce(vx, vy, vz, nx, ny, nz, uav_roughness, UAV_EPS, r1, r2)
+    sample_dir_out[tid, 0] = dx; sample_dir_out[tid, 1] = dy; sample_dir_out[tid, 2] = dz
+    px += 1e-4 * dx; py += 1e-4 * dy; pz += 1e-4 * dz
+    pos_out[0, tid, 0] = px; pos_out[0, tid, 1] = py; pos_out[0, tid, 2] = pz
+    n_pts = 1
+
+    for bounce_idx in range(n_post):
+        t_rx = _ray_sphere(px, py, pz, dx, dy, dz, rx_pos[0], rx_pos[1], rx_pos[2], rx_rad, 1e-5)
+        t_floor, floor_nx, floor_ny, floor_nz = _ray_floor(px, py, pz, dx, dy, dz, box_min[2], box_min[0], box_min[1], box_max[0], box_max[1], 1e-5)
+        t_exit = _domain_exit(px, py, pz, dx, dy, dz, box_min[0], box_min[1], box_max[0], box_max[1], box_max[2], 1e-5)
+        best_t = 1e30; best_nx = 0.0; best_ny = 0.0; best_nz = 0.0; best_obs_idx = -1; best_kind = 3
+        for obs_idx in range(n_obs):
+            t_obs, obs_nx, obs_ny, obs_nz = _ray_aabb(px, py, pz, dx, dy, dz, obs_min[obs_idx, 0], obs_min[obs_idx, 1], obs_min[obs_idx, 2], obs_max[obs_idx, 0], obs_max[obs_idx, 1], obs_max[obs_idx, 2], 1e-5)
+            if t_obs < best_t:
+                best_t = t_obs; best_nx = obs_nx; best_ny = obs_ny; best_nz = obs_nz; best_obs_idx = obs_idx; best_kind = 0
+        if t_floor < best_t:
+            best_t = t_floor; best_nx = floor_nx; best_ny = floor_ny; best_nz = floor_nz; best_obs_idx = -1; best_kind = 1
+        if t_rx < best_t: best_t = t_rx; best_kind = 4
+        if t_exit <= best_t: best_t = t_exit; best_kind = 2
+
+        if best_kind == 4:
             dist = best_t if best_t > 1e-9 else 1e-9
             power -= 20.0 * math.log10(dist) + fspl_c
-
-            # Wall attenuation Normal(0.1, 0.03) via Box-Muller
-            r1, rng = _rand01(rng); r2, rng = _rand01(rng)
-            if r1 < 1e-10: r1 = 1e-10
-            gauss = math.sqrt(-2.0 * math.log(r1)) * math.cos(2.0 * math.pi * r2)
-            refl = 0.1 + 0.03 * gauss
-            if refl < 1e-6: refl = 1e-6
-            if refl > 1.0:  refl = 1.0
-            power += 10.0 * math.log10(refl)
-
-            pos_out[n_pts, ray_id, 0] = hx; pos_out[n_pts, ray_id, 1] = hy; pos_out[n_pts, ray_id, 2] = hz
-            step_powers[n_pts, ray_id] = power
-
-            if power <= noise_floor:
-                n_pts += 1; n_pts_out[ray_id] = n_pts; power_out[ray_id] = power; return
-
-            r1, rng = _rand01(rng); r2, rng = _rand01(rng)
-            dx, dy, dz = _scatter(dx, dy, dz, best_nx, best_ny, best_nz, roughness, r1, r2)
-            dir_out[n_pts, ray_id, 0] = dx; dir_out[n_pts, ray_id, 1] = dy; dir_out[n_pts, ray_id, 2] = dz
-            n_pts += 1
-            px = hx + 1e-4*dx; py = hy + 1e-4*dy; pz = hz + 1e-4*dz
-
-        n_pts_out[ray_id] = n_pts; power_out[ray_id] = power
-
-    # ── mini_trace_kernel ─────────────────────────────────────────────────────
-
-    @cuda.jit
-    def mini_trace_kernel(
-        # Outputs — indexed by tid = hit_id * n_samp + samp_id
-        reached_rx,      # int32[N_total]
-        power_out,       # float32[N_total]
-        arr_dir_out,     # float32[N_total, 3]   arrival dir at RX
-        sample_dir_out,  # float32[N_total, 3]   outgoing dir from UAV (for Doppler)
-        pos_out,         # float32[n_post+2, N_total, 3]
-        n_pts_out,       # int32[N_total]
-        # Inputs — hit geometry, one entry per UAV hit
-        hit_pts,         # float32[N_hits, 3]
-        v_in_dirs,       # float32[N_hits, 3]   incoming direction TO UAV
-        n_uav_normals,   # float32[N_hits, 3]   outward normal at UAV surface
-        init_powers,     # float32[N_hits]       power at hit (after FSPL + RCS)
-        # Scene
-        obs_min, obs_max,
-        rx_pos, box_min, box_max,
-        # Scalars
-        rx_rad, n_post, noise_floor, roughness, uav_roughness, n_samp, fspl_c, seed_offset,
-    ):
-        """
-        One thread per (hit × sample).
-        Sample 0: specular reflection.
-        Samples 1..n_samp-1: diffuse scatter using kernel RNG (uav_roughness).
-        Direction generation and post-UAV tracing happen entirely on GPU —
-        no scatter_ray on CPU is needed.
-        """
-        tid = cuda.grid(1)
-        N_hits  = hit_pts.shape[0]
-        N_total = N_hits * n_samp
-        if tid >= N_total: return
-
-        hit_id  = tid // n_samp
-        samp_id = tid % n_samp
-
-        hx = hit_pts[hit_id, 0]; hy = hit_pts[hit_id, 1]; hz = hit_pts[hit_id, 2]
-        vx = v_in_dirs[hit_id, 0]; vy = v_in_dirs[hit_id, 1]; vz = v_in_dirs[hit_id, 2]
-        nx = n_uav_normals[hit_id, 0]; ny = n_uav_normals[hit_id, 1]; nz = n_uav_normals[hit_id, 2]
-
-        # ── Outgoing direction ────────────────────────────────────────────────
-        if samp_id == 0:
-            # Specular
-            dot = vx*nx + vy*ny + vz*nz
-            dx = vx - 2.0*dot*nx; dy = vy - 2.0*dot*ny; dz = vz - 2.0*dot*nz
-            inv = 1.0 / math.sqrt(dx*dx + dy*dy + dz*dz + 1e-30)
-            dx *= inv; dy *= inv; dz *= inv
-        else:
-            # Diffuse — deterministic per thread
-            rng0 = ((seed_offset * 6364136223846793005 + tid * 1442695040888963407 + 1) & 0x7FFFFFFF)
-            if rng0 == 0: rng0 = 1
-            r1, rng0 = _rand01(rng0); r2, _ = _rand01(rng0)
-            dx, dy, dz = _scatter(vx, vy, vz, nx, ny, nz, uav_roughness, r1, r2)
-
-        # Store outgoing direction for Doppler (CPU reads this after kernel)
-        sample_dir_out[tid, 0] = dx; sample_dir_out[tid, 1] = dy; sample_dir_out[tid, 2] = dz
-
-        # ── Trace from UAV hit point toward RX ────────────────────────────────
-        px = hx + 1e-4*dx; py = hy + 1e-4*dy; pz = hz + 1e-4*dz
-        power = init_powers[hit_id]
-        N_obs = obs_min.shape[0]
-
-        rng = ((seed_offset * 6364136223846793005 + (tid + 99991) * 1442695040888963407 + 1) & 0x7FFFFFFF)
-        if rng == 0: rng = 1
-
-        pos_out[0, tid, 0] = px; pos_out[0, tid, 1] = py; pos_out[0, tid, 2] = pz
-        n_pts = 1
-
-        for _bounce in range(n_post):
-            t_rx = _ray_sphere(px, py, pz, dx, dy, dz,
-                               rx_pos[0], rx_pos[1], rx_pos[2], rx_rad, 1e-5)
-            t_fl, fnx, fny, fnz = _ray_floor(
-                px, py, pz, dx, dy, dz,
-                box_min[2], box_min[0], box_min[1], box_max[0], box_max[1], 1e-5)
-            t_ex = _domain_exit(px, py, pz, dx, dy, dz,
-                                box_min[0], box_min[1], box_max[0], box_max[1], box_max[2], 1e-5)
-
-            best_t = 1e30; best_nx = 0.0; best_ny = 0.0; best_nz = 0.0; best_kind = 3
-            for obs_i in range(N_obs):
-                t_ob, onx, ony, onz = _ray_aabb(
-                    px, py, pz, dx, dy, dz,
-                    obs_min[obs_i,0], obs_min[obs_i,1], obs_min[obs_i,2],
-                    obs_max[obs_i,0], obs_max[obs_i,1], obs_max[obs_i,2], 1e-5)
-                if t_ob < best_t:
-                    best_t = t_ob; best_nx = onx; best_ny = ony; best_nz = onz; best_kind = 0
-            if t_fl < best_t:
-                best_t = t_fl; best_nx = fnx; best_ny = fny; best_nz = fnz; best_kind = 1
-            if t_ex <= best_t:
-                best_t = t_ex; best_kind = 2
-
-            # RX reached
-            if t_rx < best_t and t_rx < 1e29:
-                dist = t_rx if t_rx > 1e-9 else 1e-9
-                power -= 20.0 * math.log10(dist) + fspl_c
-                hx2 = px + t_rx*dx; hy2 = py + t_rx*dy; hz2 = pz + t_rx*dz
-                pos_out[n_pts, tid, 0] = hx2; pos_out[n_pts, tid, 1] = hy2; pos_out[n_pts, tid, 2] = hz2
+            pos_out[n_pts, tid, 0] = px + best_t*dx; pos_out[n_pts, tid, 1] = py + best_t*dy; pos_out[n_pts, tid, 2] = pz + best_t*dz
+            n_pts += 1; power_out[tid] = power; n_pts_out[tid] = n_pts
+            arr_dir_out[tid, 0] = dx; arr_dir_out[tid, 1] = dy; arr_dir_out[tid, 2] = dz
+            if power > noise_floor: reached_rx[tid] = 1
+            return
+        if best_kind == 2 or best_t >= 1e29:
+            if best_t < 1e29:
+                pos_out[n_pts, tid, 0] = px + best_t*dx; pos_out[n_pts, tid, 1] = py + best_t*dy; pos_out[n_pts, tid, 2] = pz + best_t*dz
                 n_pts += 1
-                power_out[tid] = power; n_pts_out[tid] = n_pts
-                arr_dir_out[tid, 0] = dx; arr_dir_out[tid, 1] = dy; arr_dir_out[tid, 2] = dz
-                if power > noise_floor: reached_rx[tid] = 1
-                return
-
-            if best_kind == 2 or best_t >= 1e29:
-                if best_t < 1e29:
-                    pos_out[n_pts, tid, 0] = px + best_t*dx
-                    pos_out[n_pts, tid, 1] = py + best_t*dy
-                    pos_out[n_pts, tid, 2] = pz + best_t*dz
-                    n_pts += 1
-                power_out[tid] = power; n_pts_out[tid] = n_pts
-                return
-
-            hx2 = px + best_t*dx; hy2 = py + best_t*dy; hz2 = pz + best_t*dz
-            dist = best_t if best_t > 1e-9 else 1e-9
-            power -= 20.0 * math.log10(dist) + fspl_c
-
-            r1, rng = _rand01(rng); r2, rng = _rand01(rng)
-            if r1 < 1e-10: r1 = 1e-10
-            gauss = math.sqrt(-2.0 * math.log(r1)) * math.cos(2.0 * math.pi * r2)
-            refl = 0.1 + 0.03 * gauss
-            if refl < 1e-6: refl = 1e-6
-            if refl > 1.0:  refl = 1.0
-            power += 10.0 * math.log10(refl)
-
-            pos_out[n_pts, tid, 0] = hx2; pos_out[n_pts, tid, 1] = hy2; pos_out[n_pts, tid, 2] = hz2
-            n_pts += 1
-
-            if power <= noise_floor:
-                n_pts_out[tid] = n_pts; power_out[tid] = power; return
-
-            r1, rng = _rand01(rng); r2, rng = _rand01(rng)
-            dx, dy, dz = _scatter(dx, dy, dz, best_nx, best_ny, best_nz, roughness, r1, r2)
-            px = hx2 + 1e-4*dx; py = hy2 + 1e-4*dy; pz = hz2 + 1e-4*dz
-
-        n_pts_out[tid] = n_pts; power_out[tid] = power
-
-    # ── Spatial-hash kernels ─────────────────────────────────────────────────
-
-    @cuda.jit
-    def _count_kernel(pos_out, n_pts, counts, cs_inv, bmin, NX, NY, NZ):
-        """Pass 1: count segment–cell overlaps. One thread per ray."""
-        ray_id = cuda.grid(1)
-        if ray_id >= pos_out.shape[1]: return
-        np_r = n_pts[ray_id]
-        for seg_id in range(np_r - 1):
-            ax = pos_out[seg_id,   ray_id, 0]; ay = pos_out[seg_id,   ray_id, 1]; az = pos_out[seg_id,   ray_id, 2]
-            bx = pos_out[seg_id+1, ray_id, 0]; by = pos_out[seg_id+1, ray_id, 1]; bz = pos_out[seg_id+1, ray_id, 2]
-            min_x = ax if ax < bx else bx; max_x = ax if ax > bx else bx
-            min_y = ay if ay < by else by; max_y = ay if ay > by else by
-            min_z = az if az < bz else bz; max_z = az if az > bz else bz
-            lo_x = int(math.floor((min_x - bmin[0]) * cs_inv)); hi_x = int(math.floor((max_x - bmin[0]) * cs_inv))
-            lo_y = int(math.floor((min_y - bmin[1]) * cs_inv)); hi_y = int(math.floor((max_y - bmin[1]) * cs_inv))
-            lo_z = int(math.floor((min_z - bmin[2]) * cs_inv)); hi_z = int(math.floor((max_z - bmin[2]) * cs_inv))
-            if lo_x < 0: lo_x = 0
-            if lo_y < 0: lo_y = 0
-            if lo_z < 0: lo_z = 0
-            if hi_x >= NX: hi_x = NX - 1
-            if hi_y >= NY: hi_y = NY - 1
-            if hi_z >= NZ: hi_z = NZ - 1
-            for cx in range(lo_x, hi_x + 1):
-                for cy in range(lo_y, hi_y + 1):
-                    for cz in range(lo_z, hi_z + 1):
-                        cuda.atomic.add(counts, cx + cy*NX + cz*NX*NY, 1)
-
-    @cuda.jit
-    def _fill_kernel(pos_out, n_pts, fill_ptr, flat_ray_ids, flat_seg_ids,
-                     cs_inv, bmin, NX, NY, NZ):
-        """Pass 2: write (ray_id, seg_id) into flat arrays."""
-        ray_id = cuda.grid(1)
-        if ray_id >= pos_out.shape[1]: return
-        np_r = n_pts[ray_id]
-        for seg_id in range(np_r - 1):
-            ax = pos_out[seg_id,   ray_id, 0]; ay = pos_out[seg_id,   ray_id, 1]; az = pos_out[seg_id,   ray_id, 2]
-            bx = pos_out[seg_id+1, ray_id, 0]; by = pos_out[seg_id+1, ray_id, 1]; bz = pos_out[seg_id+1, ray_id, 2]
-            min_x = ax if ax < bx else bx; max_x = ax if ax > bx else bx
-            min_y = ay if ay < by else by; max_y = ay if ay > by else by
-            min_z = az if az < bz else bz; max_z = az if az > bz else bz
-            lo_x = int(math.floor((min_x - bmin[0]) * cs_inv)); hi_x = int(math.floor((max_x - bmin[0]) * cs_inv))
-            lo_y = int(math.floor((min_y - bmin[1]) * cs_inv)); hi_y = int(math.floor((max_y - bmin[1]) * cs_inv))
-            lo_z = int(math.floor((min_z - bmin[2]) * cs_inv)); hi_z = int(math.floor((max_z - bmin[2]) * cs_inv))
-            if lo_x < 0: lo_x = 0
-            if lo_y < 0: lo_y = 0
-            if lo_z < 0: lo_z = 0
-            if hi_x >= NX: hi_x = NX - 1
-            if hi_y >= NY: hi_y = NY - 1
-            if hi_z >= NZ: hi_z = NZ - 1
-            for cx in range(lo_x, hi_x + 1):
-                for cy in range(lo_y, hi_y + 1):
-                    for cz in range(lo_z, hi_z + 1):
-                        pos = cuda.atomic.add(fill_ptr, cx + cy*NX + cz*NX*NY, 1)
-                        flat_ray_ids[pos] = ray_id
-                        flat_seg_ids[pos] = seg_id
+            power_out[tid] = power; n_pts_out[tid] = n_pts
+            return
+        current_eps = GROUND_EPS; current_rough = 0.0
+        if best_kind == 0:
+            current_eps = obs_eps[best_obs_idx]; current_rough = obs_roughness[best_obs_idx]
+        hit_x = px + best_t*dx; hit_y = py + best_t*dy; hit_z = pz + best_t*dz
+        dist = best_t if best_t > 1e-9 else 1e-9
+        power -= 20.0 * math.log10(dist) + fspl_c
+        r1, rng = _rand01(rng); r2, rng = _rand01(rng)
+        dx_new, dy_new, dz_new, refl = _bounce(dx, dy, dz, best_nx, best_ny, best_nz, current_rough, current_eps, r1, r2)
+        if refl < 1e-6: refl = 1e-6
+        power += 10.0 * math.log10(refl)
+        pos_out[n_pts, tid, 0] = hit_x; pos_out[n_pts, tid, 1] = hit_y; pos_out[n_pts, tid, 2] = hit_z
+        n_pts += 1
+        if power <= noise_floor:
+            n_pts_out[tid] = n_pts; power_out[tid] = power
+            return
+        dx = dx_new; dy = dy_new; dz = dz_new
+        px = hit_x + 1e-4 * dx; py = hit_y + 1e-4 * dy; pz = hit_z + 1e-4 * dz
+    n_pts_out[tid] = n_pts; power_out[tid] = power
